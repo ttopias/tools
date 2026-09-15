@@ -1,0 +1,115 @@
+#!/usr/bin/env sh
+# Run PR-Agent in the air-gapped container against $PWD.
+set -eu
+
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
+AIRGAP_SH="${AIRGAP_SH:-$SCRIPT_DIR/airgap.sh}"
+PR_AGENT_DIR="${PR_AGENT_DIR:-$(CDPATH= cd -- "$SCRIPT_DIR/../pr-agent" && pwd)}"
+IMAGE="${PR_AGENT_IMAGE:-tools-pr-agent:local}"
+CONFIG_FILE="${PR_AGENT_CONFIG:-$PR_AGENT_DIR/config.toml}"
+CA_DIR="${PR_REVIEW_CA_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/pr-review/certs}"
+ENV_CANDIDATES="${PR_REVIEW_ENV:-} ${XDG_CONFIG_HOME:-$HOME/.config}/pr-review/env ${PR_AGENT_DIR}/.env"
+LOADED_ENV_FILE=""
+
+usage() {
+    cat <<'EOF'
+Usage: pr-review <target-branch|pr-url> <command> [args...]
+
+Examples:
+  pr-review main review
+  pr-review develop describe
+  pr-review main ask "Summarize the riskiest changes"
+  pr-review https://github.com/org/repo/pull/42 review
+
+Requires ~/.config/pr-review/env (see env.example).
+Image: tools-pr-agent:local (build: pr-review --build)
+EOF
+}
+
+load_env() {
+    for f in $ENV_CANDIDATES; do
+        [ -n "$f" ] || continue
+        [ -f "$f" ] || continue
+        # shellcheck disable=SC1090
+        set -a && . "$f" && set +a
+        LOADED_ENV_FILE=$f
+        return 0
+    done
+}
+
+require_env() {
+    if [ -z "$LOADED_ENV_FILE" ]; then
+        echo "pr-review: create ~/.config/pr-review/env from scripts/env.example" >&2
+        exit 1
+    fi
+    if [ -z "${OPENAI__API_BASE:-}" ]; then
+        echo "pr-review: set OPENAI__API_BASE in ~/.config/pr-review/env" >&2
+        exit 1
+    fi
+    if [ -z "${OPENAI__KEY:-}" ]; then
+        echo "pr-review: set OPENAI__KEY in ~/.config/pr-review/env" >&2
+        exit 1
+    fi
+}
+
+build_image() {
+    docker build -t "$IMAGE" "$PR_AGENT_DIR"
+}
+
+ensure_image() {
+    if docker image inspect "$IMAGE" >/dev/null 2>&1; then
+        return 0
+    fi
+    echo "pr-review: image $IMAGE not found; building from $PR_AGENT_DIR ..." >&2
+    build_image
+}
+
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+    usage
+    exit 0
+fi
+
+if [ "${1:-}" = "--build" ]; then
+    build_image
+    exit 0
+fi
+
+if [ "$#" -lt 2 ]; then
+    usage >&2
+    exit 1
+fi
+
+if ! command -v docker >/dev/null 2>&1; then
+    echo "pr-review: docker not found in PATH" >&2
+    exit 1
+fi
+
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "pr-review: config not found: $CONFIG_FILE" >&2
+    exit 1
+fi
+
+load_env
+require_env
+ensure_image
+
+target=$1
+shift
+command=$1
+shift
+
+run_flags=""
+if [ -t 0 ] && [ -t 1 ]; then
+    run_flags="-it"
+fi
+
+# shellcheck disable=SC2086
+set -- "$AIRGAP_SH" docker run --rm $run_flags \
+    --init \
+    --env-file "$LOADED_ENV_FILE" \
+    -v "$PWD:/workspace" \
+    -w /workspace \
+    -v "$CONFIG_FILE:/config/config.toml:ro"
+[ -d "$CA_DIR" ] && set -- "$@" -v "$CA_DIR:/certs:ro"
+set -- "$@" "$IMAGE" --pr_url "$target" "$command" "$@"
+exec "$@"

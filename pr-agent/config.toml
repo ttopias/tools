@@ -1,0 +1,14 @@
+# Defaults for the image. Secrets and API URL: see ../scripts/env.example
+
+[config]
+git_provider = "local"
+publish_output = false
+verbosity_level = 1
+cli_mode = true
+use_global_settings_file = false
+extra_config_url = ""
+
+[local]
+review_path = "review.md"
+description_path = "description.md"
+improve_path = "improve.md"
