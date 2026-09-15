@@ -21,7 +21,11 @@ if [ "${AIRGAP_CONTAINER:-0}" = 1 ]; then
             *:*) host=${hostport%:*}; port=${hostport##*:} ;;
             *)
                 host=$hostport
-                port=$([ "${OPENAI__API_BASE#http://}" != "$OPENAI__API_BASE" ] && echo 80 || echo 443)
+                if [ "${OPENAI__API_BASE#http://}" != "$OPENAI__API_BASE" ]; then
+                    port=80
+                else
+                    port=443
+                fi
                 ;;
         esac
         ips=$(getent ahosts "$host" | awk '{print $1}' | sort -u)
@@ -30,18 +34,43 @@ if [ "${AIRGAP_CONTAINER:-0}" = 1 ]; then
             exit 1
         }
 
-        iptables -F OUTPUT 2>/dev/null || {
-            echo "airgap: need --cap-add=NET_ADMIN" >&2
-            exit 1
+        airgap_allow_api() {
+            local table_cmd=$1 cidr_suffix=$2
+            $table_cmd -F OUTPUT 2>/dev/null || {
+                echo "airgap: need --cap-add=NET_ADMIN ($table_cmd)" >&2
+                exit 1
+            }
+            $table_cmd -P OUTPUT DROP
+            $table_cmd -A OUTPUT -o lo -j ACCEPT
+            $table_cmd -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+            $table_cmd -A OUTPUT -d 127.0.0.11/32 -p udp --dport 53 -j ACCEPT
+            $table_cmd -A OUTPUT -d 127.0.0.11/32 -p tcp --dport 53 -j ACCEPT
+            while IFS= read -r ip; do
+                [ -n "$ip" ] || continue
+                $table_cmd -A OUTPUT -d "${ip}${cidr_suffix}" -p tcp --dport "$port" -j ACCEPT
+            done
         }
-        iptables -P OUTPUT DROP
-        iptables -A OUTPUT -o lo -j ACCEPT
-        iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-        iptables -A OUTPUT -d 127.0.0.11/32 -p udp --dport 53 -j ACCEPT
-        iptables -A OUTPUT -d 127.0.0.11/32 -p tcp --dport 53 -j ACCEPT
+
+        v4_ips=
+        v6_ips=
         while IFS= read -r ip; do
-            [ -n "$ip" ] && iptables -A OUTPUT -d "$ip/32" -p tcp --dport "$port" -j ACCEPT
+            [ -n "$ip" ] || continue
+            case "$ip" in
+                *:*) v6_ips=${v6_ips:+$v6_ips$'\n'}$ip ;;
+                *) v4_ips=${v4_ips:+$v4_ips$'\n'}$ip ;;
+            esac
         done <<<"$ips"
+
+        if [ -n "$v4_ips" ]; then
+            airgap_allow_api iptables /32 <<<"$v4_ips"
+        fi
+        if [ -n "$v6_ips" ] && command -v ip6tables >/dev/null 2>&1; then
+            airgap_allow_api ip6tables /128 <<<"$v6_ips"
+        fi
+        if [ -z "$v4_ips" ] && { [ -z "$v6_ips" ] || ! command -v ip6tables >/dev/null 2>&1; }; then
+            echo "airgap: no usable addresses for $host (need IPv4 or ip6tables for IPv6)" >&2
+            exit 1
+        fi
     fi
 
     if [ "$#" -gt 0 ]; then
@@ -60,14 +89,18 @@ fi
 }
 shift 2
 
+if [ "${AIRGAP:-1}" = 0 ]; then
+    echo "airgap: WARNING — AIRGAP=0 disables egress lockdown (break-glass only)" >&2
+fi
+
 flags=()
 while [ $# -gt 0 ] && [ "${1#-}" != "$1" ]; do
     case "$1" in
-        -e | --env | -v | --volume | --env-file | -w | --workdir | -p | --publish | --mount | --name)
+        -e | --env | -v | --volume | --env-file | -w | --workdir | -p | --publish | --mount | --name | --runtime)
             flags+=("$1" "$2")
             shift 2
             ;;
-        --env-file=* | --mount=* | -v=* | -w=* | -p=*)
+        --env-file=* | --mount=* | -v=* | -w=* | -p=* | --runtime=*)
             flags+=("$1")
             shift
             ;;
@@ -85,10 +118,39 @@ done
 image=${1:?airgap: IMAGE required}
 shift
 
-exec docker run --cap-add=NET_ADMIN \
+harden=()
+if [ "${AIRGAP_HARDEN:-1}" != 0 ]; then
+    uid_gid="${AIRGAP_USER:-$(id -u):$(id -g)}"
+    harden=(
+        --cap-drop=ALL
+        --cap-add=NET_ADMIN
+        --security-opt no-new-privileges:true
+        --read-only
+        --tmpfs /tmp:rw,nosuid,size=512m
+        --tmpfs /run:rw,nosuid,size=64m
+    )
+    if [ "$uid_gid" != root ] && [ "$uid_gid" != 0:0 ]; then
+        harden+=(--user "$uid_gid")
+        # Docker sets HOME=/ for --user; keep caches on read-only rootfs tmpfs.
+        harden+=(
+            -e HOME=/tmp
+            -e XDG_CACHE_HOME=/tmp
+        )
+    fi
+fi
+
+runtime=()
+if [ -n "${DOCKER_RUNTIME:-}" ]; then
+    runtime=(--runtime "$DOCKER_RUNTIME")
+fi
+
+# Bash 3.2 (macOS): empty arrays are errors with set -u unless guarded.
+exec docker run \
+    ${runtime+"${runtime[@]}"} \
+    ${harden+"${harden[@]}"} \
     -v "$SELF:/usr/local/bin/airgap-entry:ro" \
     --entrypoint /usr/local/bin/airgap-entry \
     -e AIRGAP_CONTAINER=1 \
     -e "AIRGAP_EP=$(docker inspect -f '{{join .Config.Entrypoint " "}}' "$image" 2>/dev/null || true)" \
     -e "AIRGAP_CMD=$(docker inspect -f '{{join .Config.Cmd " "}}' "$image" 2>/dev/null || true)" \
-    "${flags[@]}" "$image" "$@"
+    ${flags+"${flags[@]}"} "$image" "$@"

@@ -1,22 +1,24 @@
 # scripts
 
+## Config
+
+Runtime and version pins live in **[`../config`](../config)** — use **`~/config`** on the host (`ln -sf "$(pwd)/config" ~/config` after clone).
+
+| File | Role |
+|------|------|
+| `~/config/env` | Secrets, airgap flags, image names (from `env.example`) |
+| `~/config/versions.env` | Tool version and digest pins (for `docker build --build-arg`) |
+| `~/config/pr-agent.toml` | PR-Agent settings (mounted by `pr-review`) |
+| `~/config/certs/` | Optional corporate TLS roots |
+
+Override directory: `TOOLS_CONFIG`. Override env file: `TOOLS_ENV`.
+
 ## `airgap.sh`
 
-Wraps `docker run`; egress allowed only to `OPENAI__API_BASE` (via `--env-file` / `-e`):
+Wraps `docker run`: egress only to `OPENAI__API_BASE`, hardened rootfs ([ISOLATION.md](ISOLATION.md)).
 
-```bash
-./airgap.sh docker run --rm --env-file ~/.config/pr-review/env -v "$PWD:/workspace" IMAGE [CMD...]
-```
+## `pr-review` / `pi`
 
-Image needs **iptables**. Set `AIRGAP=0` to skip lockdown.
+Run PR-Agent or Pi against `$PWD` with `~/config/env`.
 
-## `pr-review`
-
-PR-Agent wrapper (uses `airgap.sh` internally):
-
-```bash
-export PATH="/path/to/tools/scripts:$PATH"
-cp env.example ~/.config/pr-review/env && chmod 600 ~/.config/pr-review/env
-pr-review --build
-cd your-repo && pr-review main review
-```
+`pi` bind-mounts host `~/.agents` (override: `PI_AGENTS_DIR`) so global skills match your local agent setup.

@@ -1,4 +1,5 @@
-# Defaults for the image. Secrets and API URL: see ../scripts/env.example
+# PR-Agent defaults. Mounted from ~/config/pr-agent.toml at runtime (see pr-review).
+# Secrets and API URL: ~/config/env
 
 [config]
 git_provider = "local"

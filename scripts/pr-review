@@ -4,12 +4,10 @@ set -eu
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
 AIRGAP_SH="${AIRGAP_SH:-$SCRIPT_DIR/airgap.sh}"
-PR_AGENT_DIR="${PR_AGENT_DIR:-$(CDPATH= cd -- "$SCRIPT_DIR/../pr-agent" && pwd)}"
-IMAGE="${PR_AGENT_IMAGE:-tools-pr-agent:local}"
-CONFIG_FILE="${PR_AGENT_CONFIG:-$PR_AGENT_DIR/config.toml}"
-CA_DIR="${PR_REVIEW_CA_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/pr-review/certs}"
-ENV_CANDIDATES="${PR_REVIEW_ENV:-} ${XDG_CONFIG_HOME:-$HOME/.config}/pr-review/env ${PR_AGENT_DIR}/.env"
-LOADED_ENV_FILE=""
+CONFIG_DIR="${TOOLS_CONFIG:-$HOME/config}"
+ENV_FILE="${TOOLS_ENV:-$CONFIG_DIR/env}"
+CA_DIR="${TOOLS_CA_DIR:-$CONFIG_DIR/certs}"
+PR_AGENT_CONFIG="${PR_AGENT_CONFIG:-$CONFIG_DIR/pr-agent.toml}"
 
 usage() {
     cat <<'EOF'
@@ -21,56 +19,40 @@ Examples:
   pr-review main ask "Summarize the riskiest changes"
   pr-review https://github.com/org/repo/pull/42 review
 
-Requires ~/.config/pr-review/env (see env.example).
-Image: tools-pr-agent:local (build: pr-review --build)
+Requires ~/config/env (see config/env.example in the tools repo).
 EOF
 }
 
-load_env() {
-    for f in $ENV_CANDIDATES; do
-        [ -n "$f" ] || continue
-        [ -f "$f" ] || continue
-        # shellcheck disable=SC1090
-        set -a && . "$f" && set +a
-        LOADED_ENV_FILE=$f
-        return 0
-    done
-}
-
 require_env() {
-    if [ -z "$LOADED_ENV_FILE" ]; then
-        echo "pr-review: create ~/.config/pr-review/env from scripts/env.example" >&2
+    if [ ! -f "$ENV_FILE" ]; then
+        echo "pr-review: create $ENV_FILE from config/env.example (see config/README.md)" >&2
         exit 1
     fi
+    # shellcheck disable=SC1090
+    set -a && . "$ENV_FILE" && set +a
     if [ -z "${OPENAI__API_BASE:-}" ]; then
-        echo "pr-review: set OPENAI__API_BASE in ~/.config/pr-review/env" >&2
+        echo "pr-review: set OPENAI__API_BASE in $ENV_FILE" >&2
         exit 1
     fi
     if [ -z "${OPENAI__KEY:-}" ]; then
-        echo "pr-review: set OPENAI__KEY in ~/.config/pr-review/env" >&2
+        echo "pr-review: set OPENAI__KEY in $ENV_FILE" >&2
+        exit 1
+    fi
+    if [ -z "${PR_AGENT_IMAGE:-}" ]; then
+        echo "pr-review: set PR_AGENT_IMAGE in $ENV_FILE" >&2
         exit 1
     fi
 }
 
-build_image() {
-    docker build -t "$IMAGE" "$PR_AGENT_DIR"
+append_argv_file() {
+    file=$1
+    while IFS= read -r -d '' arg; do
+        set -- "$@" "$arg"
+    done <"$file"
 }
 
-ensure_image() {
-    if docker image inspect "$IMAGE" >/dev/null 2>&1; then
-        return 0
-    fi
-    echo "pr-review: image $IMAGE not found; building from $PR_AGENT_DIR ..." >&2
-    build_image
-}
-
-if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+if [ "${1:-}" = -h ] || [ "${1:-}" = --help ]; then
     usage
-    exit 0
-fi
-
-if [ "${1:-}" = "--build" ]; then
-    build_image
     exit 0
 fi
 
@@ -84,19 +66,23 @@ if ! command -v docker >/dev/null 2>&1; then
     exit 1
 fi
 
-if [ ! -f "$CONFIG_FILE" ]; then
-    echo "pr-review: config not found: $CONFIG_FILE" >&2
-    exit 1
-fi
-
-load_env
 require_env
-ensure_image
+
+if [ "${AIRGAP:-1}" = 0 ]; then
+    echo "pr-review: WARNING — AIRGAP=0 disables egress lockdown (break-glass only)" >&2
+fi
 
 target=$1
 shift
 command=$1
 shift
+
+argv_stash=${TMPDIR:-/tmp}/pr-review.$$.argv
+if [ "$#" -gt 0 ]; then
+    printf '%s\0' "$@" >"$argv_stash"
+else
+    : >"$argv_stash"
+fi
 
 run_flags=""
 if [ -t 0 ] && [ -t 1 ]; then
@@ -106,10 +92,12 @@ fi
 # shellcheck disable=SC2086
 set -- "$AIRGAP_SH" docker run --rm $run_flags \
     --init \
-    --env-file "$LOADED_ENV_FILE" \
+    --env-file "$ENV_FILE" \
     -v "$PWD:/workspace" \
-    -w /workspace \
-    -v "$CONFIG_FILE:/config/config.toml:ro"
+    -w /workspace
 [ -d "$CA_DIR" ] && set -- "$@" -v "$CA_DIR:/certs:ro"
-set -- "$@" "$IMAGE" --pr_url "$target" "$command" "$@"
+[ -f "$PR_AGENT_CONFIG" ] && set -- "$@" -v "$PR_AGENT_CONFIG:/config/config.toml:ro"
+set -- "$@" "$PR_AGENT_IMAGE" --pr_url "$target" "$command"
+append_argv_file "$argv_stash"
+rm -f "$argv_stash"
 exec "$@"

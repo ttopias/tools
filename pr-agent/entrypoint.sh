@@ -2,16 +2,19 @@
 set -eu
 
 install_runtime_certs() {
-    installed=0
+    bundle=/tmp/ca-bundle.crt
+    cp /etc/ssl/certs/ca-certificates.crt "$bundle"
+    found=0
     for f in /certs/*.crt /certs/*.pem /certs/*.cer; do
         [ -f "$f" ] || continue
-        name="$(basename "$f")"
-        name="${name%.*}"
-        cp "$f" "/usr/local/share/ca-certificates/${name}.crt"
-        installed=1
+        cat "$f" >>"$bundle"
+        found=1
     done
-    if [ "$installed" -eq 1 ]; then
-        update-ca-certificates >/dev/null
+    if [ "$found" -eq 1 ]; then
+        export SSL_CERT_FILE=$bundle
+        export REQUESTS_CA_BUNDLE=$bundle
+        export CURL_CA_BUNDLE=$bundle
+        export GIT_SSL_CAINFO=$bundle
     fi
 }
 

@@ -1,0 +1,108 @@
+#!/usr/bin/env sh
+# Run Pi coding agent in the air-gapped sandbox against $PWD.
+set -eu
+
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
+AIRGAP_SH="${AIRGAP_SH:-$SCRIPT_DIR/airgap.sh}"
+CONFIG_DIR="${TOOLS_CONFIG:-$HOME/config}"
+ENV_FILE="${TOOLS_ENV:-$CONFIG_DIR/env}"
+CA_DIR="${TOOLS_CA_DIR:-$CONFIG_DIR/certs}"
+# Pi global skills: ~/.agents/skills (HOME=/tmp in image + airgap → /tmp/.agents)
+CONTAINER_AGENTS_DIR=/tmp/.agents
+
+usage() {
+    cat <<'EOF'
+Usage: pi [pi CLI args...]
+
+Runs `pi` in the sandbox with the current directory mounted at /workspace.
+Host ~/.agents is mounted at ~/.agents inside the container (skills, etc.).
+
+Requires ~/config/env (see config/env.example in the tools repo).
+EOF
+}
+
+require_env() {
+    if [ ! -f "$ENV_FILE" ]; then
+        echo "pi: create $ENV_FILE from config/env.example (see config/README.md)" >&2
+        exit 1
+    fi
+    # shellcheck disable=SC1090
+    set -a && . "$ENV_FILE" && set +a
+    if [ -z "${OPENAI__API_BASE:-}" ]; then
+        echo "pi: set OPENAI__API_BASE in $ENV_FILE (airgap allowlist)" >&2
+        exit 1
+    fi
+    if [ -z "${PI_SANDBOX_IMAGE:-}" ]; then
+        echo "pi: set PI_SANDBOX_IMAGE in $ENV_FILE" >&2
+        exit 1
+    fi
+    [ -z "${OPENAI_API_KEY:-}" ] && [ -n "${OPENAI__KEY:-}" ] && OPENAI_API_KEY=$OPENAI__KEY
+    [ -z "${OPENAI_BASE_URL:-}" ] && [ -n "${OPENAI__API_BASE:-}" ] && OPENAI_BASE_URL=$OPENAI__API_BASE
+    if [ -z "${OPENAI_API_KEY:-}" ] && [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+        echo "pi: set OPENAI_API_KEY or OPENAI__KEY in $ENV_FILE" >&2
+        exit 1
+    fi
+}
+
+append_argv_file() {
+    file=$1
+    while IFS= read -r -d '' arg; do
+        set -- "$@" "$arg"
+    done <"$file"
+}
+
+if [ "${1:-}" = -h ] || [ "${1:-}" = --help ]; then
+    usage
+    exit 0
+fi
+
+if ! command -v docker >/dev/null 2>&1; then
+    echo "pi: docker not found in PATH" >&2
+    exit 1
+fi
+
+require_env
+
+AGENTS_DIR="${PI_AGENTS_DIR:-$HOME/.agents}"
+
+if [ "${AIRGAP:-1}" = 0 ]; then
+    echo "pi: WARNING — AIRGAP=0 disables egress lockdown (break-glass only)" >&2
+fi
+
+run_flags=""
+if [ -t 0 ] && [ -t 1 ]; then
+    run_flags="-it"
+fi
+
+# POSIX sh expands every "$@" on the RHS of set to the same list — stash container argv first.
+argv_stash=${TMPDIR:-/tmp}/pi.$$.argv
+if [ "$#" -eq 0 ]; then
+    printf '%s\0' pi >"$argv_stash"
+else
+    printf '%s\0' pi "$@" >"$argv_stash"
+fi
+
+# shellcheck disable=SC2086
+set -- "$AIRGAP_SH" docker run --rm $run_flags \
+    --init \
+    --env-file "$ENV_FILE" \
+    -e NODE_USE_SYSTEM_CA=1 \
+    -e "NODE_OPTIONS=${NODE_OPTIONS:---use-system-ca}" \
+    -e NPM_CONFIG_CACHE=/tmp/npm-cache \
+    -e GOPATH=/tmp/go \
+    -e GOCACHE=/tmp/go-cache
+[ -n "${OPENAI_API_KEY:-}" ] && set -- "$@" -e "OPENAI_API_KEY=${OPENAI_API_KEY}"
+[ -n "${OPENAI_BASE_URL:-}" ] && set -- "$@" -e "OPENAI_BASE_URL=${OPENAI_BASE_URL}"
+set -- "$@" \
+    -v "$PWD:/workspace" \
+    -w /workspace
+[ -d "$CA_DIR" ] && set -- "$@" -v "$CA_DIR:/certs:ro"
+if [ -d "$AGENTS_DIR" ]; then
+    set -- "$@" -v "$AGENTS_DIR:$CONTAINER_AGENTS_DIR"
+else
+    echo "pi: note: $AGENTS_DIR not found — global skills under ~/.agents will be unavailable" >&2
+fi
+set -- "$@" "$PI_SANDBOX_IMAGE"
+append_argv_file "$argv_stash"
+rm -f "$argv_stash"
+exec "$@"
